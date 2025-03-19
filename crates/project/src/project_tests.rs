@@ -4,7 +4,6 @@ use crate::{task_inventory::TaskContexts, Event, *};
 use buffer_diff::{
     assert_hunks, BufferDiffEvent, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkStatusKind,
 };
-use collections::IndexSet;
 use fs::FakeFs;
 use futures::{future, StreamExt};
 use gpui::{App, SemanticVersion, UpdateGlobal};
@@ -21,7 +20,7 @@ use lsp::{
 };
 use parking_lot::Mutex;
 use pretty_assertions::{assert_eq, assert_matches};
-use rand::{rngs::StdRng, seq::SliceRandom, Rng};
+use rand::{rngs::StdRng, seq::SliceRandom};
 use serde_json::json;
 #[cfg(not(windows))]
 use std::os;
@@ -6712,50 +6711,49 @@ async fn test_staging_multiline_hunks_randomly(cx: &mut gpui::TestAppContext, mu
     use DiffHunkSecondaryStatus::*;
     init_test(cx);
 
-    let committed_contents = (0..LINE_COUNT)
+    let committed_lines = (0..LINE_COUNT)
         .map(|i| format!("{}\n", i))
         .collect::<Vec<String>>();
 
-    // hunks are merged from a random list of indices, potentially becoming multiline hunks
-    let hunk_lines = {
+    let committed_contents = committed_lines
+        .iter()
+        .map(String::as_str)
+        .collect::<String>();
+
+    let (hunk_indices, hunk_heights): (Vec<usize>, Vec<usize>) = {
         let mut candidates = (0..LINE_COUNT).collect::<Vec<usize>>();
         candidates.shuffle(&mut rng);
 
-        candidates
+        let hunk_lines = candidates
             .into_iter()
             .take(HUNK_COUNT)
             .sorted()
-            .collect::<Vec<usize>>()
+            .collect::<Vec<usize>>();
+
+        // mix commited contents with chosen hunk lines
+        let file_contents = {
+            let mut file_contents = committed_lines.clone();
+            for &hunk_line in &hunk_lines {
+                file_contents[hunk_line] = format!("{} <- hunk here\n", hunk_line);
+            }
+            file_contents
+        };
+
+        // hunks are merged from a random list of indices, potentially becoming multiline hunks
+        let (hunk_indices, hunk_heights) = hunk_lines
+            .chunk_by(|&a, &b| a + 1 == b)
+            .map(|chunk| (chunk[0], chunk.len()))
+            .collect();
+
+        (file_contents, hunk_indices, hunk_heights)
     };
 
-    // mix commited contents with chosen hunk lines
-    let file_contents = {
-        let mut file_contents = committed_contents.clone();
-        for &hunk_line in &hunk_lines {
-            file_contents[hunk_line] = format!("{} hunk\n", hunk_line);
-        }
-        file_contents
-    };
-
-    let hunk_indices = hunk_lines
-        .chunk_by(|&a, &b| a + 1 == b)
-        .map(|chunk| chunk[0])
-        .collect::<Vec<usize>>();
-
-    // will stage random hunks in random order, this is the order
+    // will stage hunks in this random order
     let hunk_indices_shuffled = {
         let mut indices = hunk_indices.clone();
         indices.shuffle(&mut rng);
         indices
     };
-
-    // candidates
-    //     .chunk_by(|&a, &b| a + 1 == b)
-    //     .map(|chunk| (chunk.first().unwrap(), chunk.len()))
-    //     .collect()
-
-    // // we delay filesystem events to test concurrency problems between reading and writing
-    // fs.flush_events(1);
 
     let fs = FakeFs::new(cx.background_executor.clone());
     fs.insert_tree(
@@ -6766,7 +6764,6 @@ async fn test_staging_multiline_hunks_randomly(cx: &mut gpui::TestAppContext, mu
         }),
     )
     .await;
-
     fs.set_head_for_repo(
         "/dir/.git".as_ref(),
         &[("file.txt".into(), committed_contents.clone())],
@@ -6775,9 +6772,7 @@ async fn test_staging_multiline_hunks_randomly(cx: &mut gpui::TestAppContext, mu
         "/dir/.git".as_ref(),
         &[("file.txt".into(), committed_contents.clone())],
     );
-
     let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
-
     let buffer = project
         .update(cx, |project, cx| {
             project.open_local_buffer("/dir/file.txt", cx)
@@ -6791,6 +6786,9 @@ async fn test_staging_multiline_hunks_randomly(cx: &mut gpui::TestAppContext, mu
         })
         .await
         .unwrap();
+
+    // // we delay filesystem events to test concurrency problems between reading and writing
+    // fs.flush_events(1);
 
     let expected_initial_all_unstaged: Vec<(Range<u32>, String, String, DiffHunkStatus)> =
         hunk_lines
