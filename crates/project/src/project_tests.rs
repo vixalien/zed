@@ -4,6 +4,7 @@ use crate::{task_inventory::TaskContexts, Event, *};
 use buffer_diff::{
     assert_hunks, BufferDiffEvent, DiffHunkSecondaryStatus, DiffHunkStatus, DiffHunkStatusKind,
 };
+use collections::IndexSet;
 use fs::FakeFs;
 use futures::{future, StreamExt};
 use gpui::{App, SemanticVersion, UpdateGlobal};
@@ -20,12 +21,11 @@ use lsp::{
 };
 use parking_lot::Mutex;
 use pretty_assertions::{assert_eq, assert_matches};
+use rand::{rngs::StdRng, seq::SliceRandom, Rng};
 use serde_json::json;
 #[cfg(not(windows))]
 use std::os;
-use std::{str::FromStr, sync::OnceLock};
-
-use std::{mem, num::NonZeroU32, ops::Range, task::Poll};
+use std::{mem, num::NonZeroU32, ops::Range, str::FromStr, sync::OnceLock, task::Poll};
 use task::{ResolvedTask, TaskContext};
 use unindent::Unindent as _;
 use util::{
@@ -6698,6 +6698,190 @@ async fn test_staging_lots_of_hunks_fast(cx: &mut gpui::TestAppContext) {
             &expected_hunks,
         );
     });
+}
+
+#[gpui::test(iterations = 1000)]
+async fn test_staging_multiline_hunks_randomly(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
+    // to ease debugging, tweak these bools to see what specific notch (combination) is making the test fail
+    let random_staging_order = true;
+    let random_delayed_events = true;
+
+    const LINE_COUNT: usize = 1000;
+    const HUNK_COUNT: usize = 500;
+
+    use DiffHunkSecondaryStatus::*;
+    init_test(cx);
+
+    let committed_contents = (0..LINE_COUNT)
+        .map(|i| format!("{}\n", i))
+        .collect::<Vec<String>>();
+
+    // hunks are merged from a random list of indices, potentially becoming multiline hunks
+    let hunk_lines = {
+        let mut candidates = (0..LINE_COUNT).collect::<Vec<usize>>();
+        candidates.shuffle(&mut rng);
+
+        candidates
+            .into_iter()
+            .take(HUNK_COUNT)
+            .sorted()
+            .collect::<Vec<usize>>()
+    };
+
+    // mix commited contents with chosen hunk lines
+    let file_contents = {
+        let mut file_contents = committed_contents.clone();
+        for &hunk_line in &hunk_lines {
+            file_contents[hunk_line] = format!("{} hunk\n", hunk_line);
+        }
+        file_contents
+    };
+
+    let hunk_indices = hunk_lines
+        .chunk_by(|&a, &b| a + 1 == b)
+        .map(|chunk| chunk[0])
+        .collect::<Vec<usize>>();
+
+    // will stage random hunks in random order, this is the order
+    let hunk_indices_shuffled = {
+        let mut indices = hunk_indices.clone();
+        indices.shuffle(&mut rng);
+        indices
+    };
+
+    // candidates
+    //     .chunk_by(|&a, &b| a + 1 == b)
+    //     .map(|chunk| (chunk.first().unwrap(), chunk.len()))
+    //     .collect()
+
+    // // we delay filesystem events to test concurrency problems between reading and writing
+    // fs.flush_events(1);
+
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/dir",
+        json!({
+            ".git": {},
+            "file.txt": file_contents.clone()
+        }),
+    )
+    .await;
+
+    fs.set_head_for_repo(
+        "/dir/.git".as_ref(),
+        &[("file.txt".into(), committed_contents.clone())],
+    );
+    fs.set_index_for_repo(
+        "/dir/.git".as_ref(),
+        &[("file.txt".into(), committed_contents.clone())],
+    );
+
+    let project = Project::test(fs.clone(), ["/dir".as_ref()], cx).await;
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer("/dir/file.txt", cx)
+        })
+        .await
+        .unwrap();
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+    let uncommitted_diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+
+    let expected_initial_all_unstaged: Vec<(Range<u32>, String, String, DiffHunkStatus)> =
+        hunk_lines
+            .step_by(5)
+            .map(|i| {
+                (
+                    i as u32..i as u32 + 1,
+                    format!("{}\n", i),
+                    different_lines[i / 5].clone(),
+                    DiffHunkStatus::modified(HasSecondaryHunk),
+                )
+            })
+            .collect();
+
+    // The hunks are initially unstaged
+    uncommitted_diff.read_with(cx, |diff, cx| {
+        assert_hunks(
+            diff.hunks(&snapshot, cx),
+            &snapshot,
+            &diff.base_text_string().unwrap(),
+            &expected_hunks,
+        );
+    });
+
+    // for (_, _, _, status) in expected_hunks.iter_mut() {
+    //     *status = DiffHunkStatus::modified(SecondaryHunkRemovalPending);
+    // }
+
+    // // Stage every hunk with a different call
+    // uncommitted_diff.update(cx, |diff, cx| {
+    //     let hunks = diff.hunks(&snapshot, cx).collect::<Vec<_>>();
+    //     for hunk in hunks {
+    //         diff.stage_or_unstage_hunks(true, &[hunk], &snapshot, true, cx);
+    //     }
+
+    //     assert_hunks(
+    //         diff.hunks(&snapshot, cx),
+    //         &snapshot,
+    //         &diff.base_text_string().unwrap(),
+    //         &expected_hunks,
+    //     );
+    // });
+
+    // // If we wait, we'll have no pending hunks
+    // cx.run_until_parked();
+    // for (_, _, _, status) in expected_hunks.iter_mut() {
+    //     *status = DiffHunkStatus::modified(NoSecondaryHunk);
+    // }
+
+    // uncommitted_diff.update(cx, |diff, cx| {
+    //     assert_hunks(
+    //         diff.hunks(&snapshot, cx),
+    //         &snapshot,
+    //         &diff.base_text_string().unwrap(),
+    //         &expected_hunks,
+    //     );
+    // });
+
+    // for (_, _, _, status) in expected_hunks.iter_mut() {
+    //     *status = DiffHunkStatus::modified(SecondaryHunkAdditionPending);
+    // }
+
+    // // Unstage every hunk with a different call
+    // uncommitted_diff.update(cx, |diff, cx| {
+    //     let hunks = diff.hunks(&snapshot, cx).collect::<Vec<_>>();
+    //     for hunk in hunks {
+    //         diff.stage_or_unstage_hunks(false, &[hunk], &snapshot, true, cx);
+    //     }
+
+    //     assert_hunks(
+    //         diff.hunks(&snapshot, cx),
+    //         &snapshot,
+    //         &diff.base_text_string().unwrap(),
+    //         &expected_hunks,
+    //     );
+    // });
+
+    // // If we wait, we'll have no pending hunks, again
+    // cx.run_until_parked();
+    // for (_, _, _, status) in expected_hunks.iter_mut() {
+    //     *status = DiffHunkStatus::modified(HasSecondaryHunk);
+    // }
+
+    // uncommitted_diff.update(cx, |diff, cx| {
+    //     assert_hunks(
+    //         diff.hunks(&snapshot, cx),
+    //         &snapshot,
+    //         &diff.base_text_string().unwrap(),
+    //         &expected_hunks,
+    //     );
+    // });
 }
 
 #[gpui::test]
